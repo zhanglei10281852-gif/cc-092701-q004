@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -13,6 +14,25 @@ class TemplateCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+
+
+class TemplateVersionDraftCreate(BaseModel):
+    base_version: int | None = Field(default=None, ge=1)
+
+
+class TemplateVersionUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    algorithm: str = Field(min_length=2, max_length=120)
+    parameter_schema: dict[str, dict[str, Any]]
+    default_parameters: dict[str, Any] = Field(default_factory=dict)
+    max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
+    max_attempts: int = Field(default=3, ge=1, le=20)
+
+
+class TemplateVersionPublish(BaseModel):
+    effective_at: datetime | None = None
+    expected_effective_version: int | None = Field(default=None, ge=1)
+    force: bool = False
 
 
 class QuotaSet(BaseModel):

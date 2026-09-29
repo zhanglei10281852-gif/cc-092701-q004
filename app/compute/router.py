@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate, TemplateVersionDraftCreate, TemplateVersionPublish, TemplateVersionUpdate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -20,6 +20,41 @@ def list_templates():
 @router.post("/templates", status_code=201)
 def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=1)):
     return service().create_template(payload.model_dump(), actor)
+
+
+@router.get("/templates/{code}/versions")
+def list_versions(code: str):
+    return {"items": service().list_versions(code)}
+
+
+@router.post("/templates/{code}/versions", status_code=201)
+def create_draft(code: str, payload: TemplateVersionDraftCreate, actor: str = Query(..., min_length=1)):
+    return service().create_draft(code, payload.model_dump(), actor)
+
+
+@router.get("/templates/{code}/versions/{version}")
+def get_version(code: str, version: int):
+    return service().get_version(code, version)
+
+
+@router.put("/templates/{code}/versions/{version}")
+def update_draft(code: str, version: int, payload: TemplateVersionUpdate, actor: str = Query(..., min_length=1)):
+    return service().update_draft(code, version, payload.model_dump(), actor)
+
+
+@router.post("/templates/{code}/versions/{version}/publish")
+def publish_version(code: str, version: int, payload: TemplateVersionPublish, actor: str = Query(..., min_length=1)):
+    return service().publish_version(code, version, payload.model_dump(), actor)
+
+
+@router.delete("/templates/{code}/versions/{version}")
+def discard_draft(code: str, version: int, actor: str = Query(..., min_length=1)):
+    return service().discard_draft(code, version, actor)
+
+
+@router.get("/templates/{code}/diff")
+def diff_versions(code: str, from_version: int = Query(..., ge=1), to_version: int = Query(..., ge=1)):
+    return service().diff_versions(code, from_version, to_version)
 
 
 @router.put("/quotas")
@@ -40,6 +75,11 @@ def list_tasks(status: str | None = None, project_code: str | None = None, reque
 @router.get("/task-details/{task_id}")
 def get_task(task_id: int):
     return service().get_task(task_id)
+
+
+@router.post("/tasks/{task_id}/revalidate")
+def revalidate_task(task_id: int):
+    return service().revalidate_task(task_id)
 
 
 @router.post("/tasks/claim")

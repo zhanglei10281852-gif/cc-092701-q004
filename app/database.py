@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -231,6 +232,28 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS compute_template_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published')),
+    name TEXT NOT NULL,
+    algorithm TEXT NOT NULL,
+    parameter_schema_json TEXT NOT NULL,
+    default_parameters_json TEXT NOT NULL DEFAULT '{}',
+    max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    base_version INTEGER,
+    effective_at TEXT,
+    published_by TEXT,
+    published_at TEXT,
+    content_digest TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(template_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_template_versions_effective ON compute_template_versions(template_id,status,effective_at);
 CREATE TABLE IF NOT EXISTS compute_quotas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     subject_type TEXT NOT NULL CHECK(subject_type IN ('user','role','project')),
@@ -359,10 +382,61 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_compute_versioning(connection: sqlite3.Connection) -> None:
+    """为计算模板补齐版本表、任务校验快照列，并回填历史数据（幂等）。"""
+    from app.compute.versioning import build_validation_snapshot, content_digest, content_from_row  # 延迟导入避免循环依赖
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    if "template_version_id" not in columns:
+        connection.execute("ALTER TABLE compute_tasks ADD COLUMN template_version_id INTEGER REFERENCES compute_template_versions(id)")
+    if "template_version" not in columns:
+        connection.execute("ALTER TABLE compute_tasks ADD COLUMN template_version INTEGER")
+    if "validation_snapshot_json" not in columns:
+        connection.execute("ALTER TABLE compute_tasks ADD COLUMN validation_snapshot_json TEXT NOT NULL DEFAULT ''")
+
+    templates = connection.execute(
+        "SELECT * FROM compute_templates WHERE NOT EXISTS (SELECT 1 FROM compute_template_versions v WHERE v.template_id = compute_templates.id)"
+    ).fetchall()
+    for template in templates:
+        content = content_from_row(dict(template))
+        connection.execute(
+            "INSERT INTO compute_template_versions(template_id,version,status,name,algorithm,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,base_version,effective_at,published_by,published_at,content_digest,created_by,created_at,updated_at) VALUES(?,1,'published',?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
+            (
+                template["id"], template["name"], template["algorithm"], template["parameter_schema_json"], template["default_parameters_json"],
+                template["max_runtime_seconds"], template["max_attempts"], template["created_at"], template["created_by"], template["created_at"],
+                content_digest(content), template["created_by"], template["created_at"], template["updated_at"],
+            ),
+        )
+
+    tasks = connection.execute("SELECT * FROM compute_tasks WHERE template_version_id IS NULL").fetchall()
+    for task in tasks:
+        version = connection.execute(
+            "SELECT * FROM compute_template_versions WHERE template_id=? AND status='published' AND effective_at<=? ORDER BY effective_at DESC, version DESC LIMIT 1",
+            (task["template_id"], task["created_at"]),
+        ).fetchone() or connection.execute(
+            "SELECT * FROM compute_template_versions WHERE template_id=? ORDER BY version LIMIT 1",
+            (task["template_id"],),
+        ).fetchone()
+        if version is None:
+            continue
+        code = connection.execute("SELECT code FROM compute_templates WHERE id=?", (task["template_id"],)).fetchone()["code"]
+        snapshot = build_validation_snapshot(
+            template_code=code,
+            version_row=dict(version),
+            supplied_parameters=json.loads(task["parameters_json"]),
+            captured_at=task["created_at"],
+        )
+        connection.execute(
+            "UPDATE compute_tasks SET template_version_id=?, template_version=?, validation_snapshot_json=? WHERE id=?",
+            (version["id"], version["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), task["id"]),
+        )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_compute_versioning(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
