@@ -17,45 +17,223 @@ def digest(value: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+SCALAR_TEMPLATE_FIELDS = ("name", "algorithm", "max_runtime_seconds", "max_attempts")
+
+
 class ComputeOperationsService:
-    """管理计算模板、配额、任务租约、结果版本和人工干预。"""
+    """管理计算模板的草稿/发布版本、配额、任务租约、结果版本和人工干预。
+
+    模板版本一旦发布即不可变：任务在提交时冻结完整校验输入快照，
+    此后所有复核只依赖快照，与当前有效版本无关。
+    """
 
     def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
         self.connection = connection or get_connection()
         self.clock = clock or SystemClock()
         self.repository = ComputeRepository(self.connection)
 
+    # ------------------------------------------------------------------
+    # 模板：查询当前有效版本
+    # ------------------------------------------------------------------
     def list_templates(self) -> list[dict[str, Any]]:
-        return self.repository.active_templates()
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            self._activate_due(repository, now)
+            return repository.list_template_codes()
 
+    def get_template(self, code: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            self._activate_due_for(repository, template_code["id"], now)
+            publication = repository.active_publication(template_code["id"], now)
+            if publication is None:
+                raise NotFoundError("参数模板尚未发布任何有效版本")
+            version = repository.template_version(template_code["id"], publication["version"])
+            return self._template_version_view(repository, dict(version))
+
+    # ------------------------------------------------------------------
+    # 模板：草稿编辑（可反复修改，不影响任何任务与查询）
+    # ------------------------------------------------------------------
     def create_template(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         self._validate_schema(payload["parameter_schema"], payload["default_parameters"])
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            if repository.template_by_code(payload["code"]):
+            if repository.template_code_row(payload["code"]):
                 raise ConflictError("参数模板编码已存在")
-            return repository.create_template(
-                code=payload["code"], name=payload["name"], algorithm=payload["algorithm"],
+            template_code = repository.create_template_code(code=payload["code"], created_by=actor, now=now)
+            content_digest = self._content_digest(payload)
+            row = repository.insert_template_version(
+                template_code_id=template_code["id"], code=payload["code"], version=1,
+                name=payload["name"], algorithm=payload["algorithm"],
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
-                created_by=actor, now=now,
+                content_digest=content_digest, created_by=actor, now=now,
             )
+            return self._template_version_view(repository, dict(row))
 
+    def get_draft(self, code: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            self._activate_due_for(repository, template_code["id"], now)
+            draft = repository.draft_template_version(template_code["id"])
+            if draft is None:
+                raise NotFoundError("该模板当前没有可编辑的草稿")
+            return self._template_version_view(repository, dict(draft))
+
+    def save_draft(self, code: str, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        self._validate_schema(payload["parameter_schema"], payload["default_parameters"])
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            content_digest = self._content_digest(payload)
+            draft = repository.draft_template_version(template_code["id"])
+            if draft is None:
+                latest = repository.latest_template_version(template_code["id"])
+                next_version = 1 if latest is None else int(latest["version"]) + 1
+                row = repository.insert_template_version(
+                    template_code_id=template_code["id"], code=code, version=next_version,
+                    name=payload["name"], algorithm=payload["algorithm"],
+                    parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
+                    max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
+                    content_digest=content_digest, created_by=actor, now=now,
+                )
+            else:
+                repository.update_draft_template_version(
+                    version_id=draft["id"], name=payload["name"], algorithm=payload["algorithm"],
+                    parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
+                    max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
+                    content_digest=content_digest, now=now,
+                )
+                row = repository.template_version_by_id(draft["id"])
+            return self._template_version_view(repository, dict(row))
+
+    # ------------------------------------------------------------------
+    # 模板：发布（立即或定时）
+    # ------------------------------------------------------------------
+    def publish_template(self, code: str, actor: str, effective_at: datetime | None) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        effective = to_storage(effective_at) if effective_at is not None else now
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            self._activate_due_for(repository, template_code["id"], now)
+            draft = repository.draft_template_version(template_code["id"])
+            if draft is None:
+                raise ConflictError("该模板没有可发布的草稿")
+            if effective_at is not None and effective_at <= now_value:
+                effective = now
+            try:
+                if not repository.mark_version_published(version_id=draft["id"], now=now):
+                    # 并发发布：草稿已被另一个事务发布，当前事务不再写入发布记录。
+                    raise ConflictError("草稿已被其他发布操作处理，请刷新后重试")
+                repository.insert_publication(
+                    template_code_id=template_code["id"], version=draft["version"],
+                    effective_at=effective, published_by=actor, now=now,
+                )
+                if effective <= now:
+                    repository.activate_publication(
+                        connection, template_code_id=template_code["id"], version=draft["version"], now=now,
+                    )
+            except sqlite3.IntegrityError as exc:
+                # 唯一约束：同一模板同时只能有一个待生效发布。事务回滚，当前有效版本不变。
+                raise ConflictError("该模板已存在待生效的发布，请先取消后再发布新版本") from exc
+            publication_row = repository.publication_for_version(template_code["id"], draft["version"])
+            view = self._template_version_view(repository, dict(repository.template_version_by_id(draft["id"])))
+            view["publication"] = dict(publication_row)
+            return view
+
+    def cancel_scheduled_publication(self, code: str, actor: str) -> dict[str, Any]:
+        del actor
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            scheduled = repository.future_publication(template_code["id"], now)
+            if scheduled is None:
+                raise NotFoundError("该模板没有未来生效的发布安排")
+            repository.cancel_scheduled_publication(template_code_id=template_code["id"], now=now)
+            return {"code": code, "cancelled_version": scheduled["version"], "effective_at": scheduled["effective_at"]}
+
+    def activate_due_publications(self, actor: str = "publication-scheduler") -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            activated = self._activate_due(repository, now, actor=actor)
+        return {"activated": activated, "checked_at": now}
+
+    # ------------------------------------------------------------------
+    # 模板：版本历史与差异（版本不可删除，仅可回放）
+    # ------------------------------------------------------------------
+    def list_versions(self, code: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            self._activate_due_for(repository, template_code["id"], now)
+            versions = repository.list_template_versions(code)
+        return {"code": code, "items": versions}
+
+    def get_version(self, code: str, version: int) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            self._activate_due_for(repository, template_code["id"], now)
+            row = repository.template_version(template_code["id"], version)
+            if row is None:
+                raise NotFoundError("模板版本不存在")
+            return self._template_version_view(repository, dict(row))
+
+    def diff_versions(self, code: str, from_version: int, to_version: int) -> dict[str, Any]:
+        if from_version == to_version:
+            raise ValidationError("对比的两个版本必须不同")
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            template_code = self._require_template_code(repository, code)
+            before = repository.template_version(template_code["id"], from_version)
+            after = repository.template_version(template_code["id"], to_version)
+            if before is None or after is None:
+                raise NotFoundError("模板版本不存在")
+            return self._build_diff(before, after)
+
+    # ------------------------------------------------------------------
+    # 配额
+    # ------------------------------------------------------------------
     def set_quota(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             return ComputeRepository(connection).upsert_quota(actor=actor, now=now, **payload)
 
+    # ------------------------------------------------------------------
+    # 任务：提交（冻结当时完整校验输入）
+    # ------------------------------------------------------------------
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            template = repository.template_by_code(payload["template_code"])
-            if template is None or not template["active"]:
-                raise NotFoundError("参数模板不存在或已经停用")
-            parameters = self._validate_parameters(template, payload["parameters"])
+            template_code = repository.template_code_row(payload["template_code"])
+            if template_code is None:
+                raise NotFoundError("参数模板不存在或尚未发布")
+            self._activate_due_for(repository, template_code["id"], now)
+            publication = repository.active_publication(template_code["id"], now)
+            if publication is None:
+                raise NotFoundError("参数模板不存在或尚未发布")
+            template = repository.template_version(template_code["id"], publication["version"])
+            if template is None or template["status"] != "published":
+                raise NotFoundError("参数模板不存在或尚未发布")
+            schema = json.loads(template["parameter_schema_json"])
+            defaults = json.loads(template["default_parameters_json"])
+            parameters = self._validate_inputs(schema, defaults, payload["parameters"])
             existing = repository.task_by_idempotency(payload["requested_by"], payload["idempotency_key"])
             parameter_digest = digest(parameters)
             if existing is not None:
@@ -63,11 +241,25 @@ class ComputeOperationsService:
                     raise ConflictError("同一幂等键对应了不同的计算参数")
                 return dict(repository.task_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
+            snapshot = {
+                "template_code": template["code"],
+                "template_version": template["version"],
+                "template_version_id": template["id"],
+                "name": template["name"],
+                "algorithm": template["algorithm"],
+                "parameter_schema": schema,
+                "default_parameters": defaults,
+                "parameters": parameters,
+                "max_runtime_seconds": template["max_runtime_seconds"],
+                "max_attempts": template["max_attempts"],
+                "captured_at": now,
+            }
             return repository.create_task(
-                template_id=template["id"], project_code=payload["project_code"],
+                template_version=template, project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
-                parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
+                parameter_digest=parameter_digest, validation_snapshot=snapshot,
+                priority=payload["priority"], idempotency_key=payload["idempotency_key"],
+                max_attempts=template["max_attempts"], now=now,
             )
 
     def list_tasks(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -78,9 +270,35 @@ class ComputeOperationsService:
         if row is None:
             raise NotFoundError("计算任务不存在")
         result = dict(row)
+        result["validation_snapshot"] = json.loads(result.pop("validation_snapshot_json"))
         result["results"] = self.repository.result_versions(task_id)
         result["interventions"] = self.repository.interventions(task_id)
         return result
+
+    def replay_task_validation(self, task_id: int) -> dict[str, Any]:
+        """按任务提交时冻结的快照重新复核参数，不读取当前有效模板版本。
+
+        服务重启后同样可用：所有规则均来自任务行内的快照，
+        历史任务永远按原规则复核。
+        """
+        row = self.repository.task_by_id(task_id)
+        if row is None:
+            raise NotFoundError("计算任务不存在")
+        snapshot = json.loads(row["validation_snapshot_json"])
+        parameters = self._validate_inputs(
+            snapshot["parameter_schema"], snapshot["default_parameters"], snapshot["parameters"],
+        )
+        replayed_digest = digest(parameters)
+        return {
+            "task_id": task_id,
+            "template_code": snapshot["template_code"],
+            "template_version": snapshot["template_version"],
+            "captured_at": snapshot["captured_at"],
+            "replayed_at": to_storage(self.clock.now()),
+            "valid": replayed_digest == row["parameter_digest"],
+            "parameter_digest": row["parameter_digest"],
+            "replayed_digest": replayed_digest,
+        }
 
     def claim(self, worker_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
         now_value = self.clock.now()
@@ -211,10 +429,18 @@ class ComputeOperationsService:
         return {"recovered": recovered, "exhausted": exhausted}
 
     def summary(self) -> dict[str, Any]:
-        rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
-        oldest = self.connection.execute("SELECT MIN(created_at) FROM compute_tasks WHERE status='queued'").fetchone()[0]
-        return {"states": {row["status"]: row["amount"] for row in rows}, "oldest_queued_at": oldest, "templates": len(self.repository.active_templates())}
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            self._activate_due(repository, now)
+            rows = connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
+            oldest = connection.execute("SELECT MIN(created_at) FROM compute_tasks WHERE status='queued'").fetchone()[0]
+            templates = connection.execute("SELECT COUNT(*) FROM compute_template_publications WHERE status='active'").fetchone()[0]
+        return {"states": {row["status"]: row["amount"] for row in rows}, "oldest_queued_at": oldest, "templates": int(templates)}
 
+    # ------------------------------------------------------------------
+    # 内部辅助
+    # ------------------------------------------------------------------
     def _intervene(self, task_id: int, actor: str, reason: str, action: str, batch_key: str, mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
@@ -259,9 +485,9 @@ class ComputeOperationsService:
         if set(defaults) - set(schema):
             raise ValidationError("默认值包含未声明参数")
 
-    def _validate_parameters(self, template: sqlite3.Row, supplied: dict[str, Any]) -> dict[str, Any]:
-        schema = json.loads(template["parameter_schema_json"])
-        values = {**json.loads(template["default_parameters_json"]), **supplied}
+    @staticmethod
+    def _validate_inputs(schema: dict[str, dict[str, Any]], defaults: dict[str, Any], supplied: dict[str, Any]) -> dict[str, Any]:
+        values = {**defaults, **supplied}
         unknown = set(values) - set(schema)
         if unknown:
             raise ValidationError("包含模板未声明的参数", context={"parameters": sorted(unknown)})
@@ -284,3 +510,86 @@ class ComputeOperationsService:
                 raise ValidationError(f"参数 {name} 不在允许的选项中")
             normalized[name] = value
         return normalized
+
+    @staticmethod
+    def _content_digest(payload: dict[str, Any]) -> str:
+        return digest(
+            {
+                "name": payload["name"],
+                "algorithm": payload["algorithm"],
+                "parameter_schema": payload["parameter_schema"],
+                "default_parameters": payload["default_parameters"],
+                "max_runtime_seconds": payload["max_runtime_seconds"],
+                "max_attempts": payload["max_attempts"],
+            }
+        )
+
+    @staticmethod
+    def _require_template_code(repository: ComputeRepository, code: str) -> sqlite3.Row:
+        template_code = repository.template_code_row(code)
+        if template_code is None:
+            raise NotFoundError("参数模板不存在")
+        return template_code
+
+    @staticmethod
+    def _activate_due(repository: ComputeRepository, now: str, *, actor: str = "publication-scheduler") -> list[dict[str, Any]]:
+        """把所有已到期的定时发布切换为 active。幂等，可在任意读路径惰性调用。"""
+        activated: list[dict[str, Any]] = []
+        for publication in repository.due_scheduled_publications(now):
+            if repository.activate_publication(
+                repository.connection,
+                template_code_id=publication["template_code_id"],
+                version=publication["version"],
+                now=now,
+            ):
+                activated.append(
+                    {
+                        "template_code_id": publication["template_code_id"],
+                        "version": publication["version"],
+                        "effective_at": publication["effective_at"],
+                        "activated_by": actor,
+                    }
+                )
+        return activated
+
+    def _activate_due_for(self, repository: ComputeRepository, template_code_id: int, now: str) -> None:
+        self._activate_due(repository, now)
+
+    @staticmethod
+    def _template_version_view(repository: ComputeRepository, version: dict[str, Any]) -> dict[str, Any]:
+        publication = repository.publication_for_version(version["template_code_id"], version["version"])
+        view = dict(version)
+        view["publication"] = dict(publication) if publication is not None else None
+        return view
+
+    @staticmethod
+    def _build_diff(before: sqlite3.Row, after: sqlite3.Row) -> dict[str, Any]:
+        changes: list[dict[str, Any]] = []
+        for field in SCALAR_TEMPLATE_FIELDS:
+            if before[field] != after[field]:
+                changes.append({"field": field, "from": before[field], "to": after[field]})
+        before_schema = json.loads(before["parameter_schema_json"])
+        after_schema = json.loads(after["parameter_schema_json"])
+        for name in sorted(set(before_schema) | set(after_schema)):
+            if name not in before_schema:
+                changes.append({"field": f"parameter_schema.{name}", "change": "added", "to": after_schema[name]})
+            elif name not in after_schema:
+                changes.append({"field": f"parameter_schema.{name}", "change": "removed", "from": before_schema[name]})
+            elif before_schema[name] != after_schema[name]:
+                changes.append({"field": f"parameter_schema.{name}", "change": "modified", "from": before_schema[name], "to": after_schema[name]})
+        before_defaults = json.loads(before["default_parameters_json"])
+        after_defaults = json.loads(after["default_parameters_json"])
+        for name in sorted(set(before_defaults) | set(after_defaults)):
+            if name not in before_defaults:
+                changes.append({"field": f"default_parameters.{name}", "change": "added", "to": after_defaults[name]})
+            elif name not in after_defaults:
+                changes.append({"field": f"default_parameters.{name}", "change": "removed", "from": before_defaults[name]})
+            elif before_defaults[name] != after_defaults[name]:
+                changes.append({"field": f"default_parameters.{name}", "change": "modified", "from": before_defaults[name], "to": after_defaults[name]})
+        return {
+            "code": before["code"],
+            "from_version": before["version"],
+            "to_version": after["version"],
+            "identical": before["content_digest"] == after["content_digest"],
+            "changes": changes,
+        }

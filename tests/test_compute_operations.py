@@ -36,6 +36,8 @@ def submit_payload(key: str, *, user: str = "researcher-1", priority: int = 50) 
 def create_template(client) -> None:
     response = client.post("/api/compute/templates?actor=administrator", json=TEMPLATE)
     assert response.status_code == 201, response.text
+    published = client.post("/api/compute/templates/solver-a/publish?actor=administrator", json={})
+    assert published.status_code == 201, published.text
 
 
 def test_template_submission_idempotency_and_parameter_validation(client):
@@ -103,6 +105,7 @@ def test_failure_backoff_and_expired_lease_recovery(client):
     clock = FrozenClock(datetime(2026, 9, 26, 2, 0, tzinfo=UTC))
     service = ComputeOperationsService(get_connection(), clock)
     service.create_template(TEMPLATE, "administrator")
+    service.publish_template("solver-a", "administrator", None)
     first = service.submit(submit_payload("failure-000001"))
     claimed = service.claim("worker-a", ["solver-a"], 10)
     assert claimed and claimed["id"] == first["id"]

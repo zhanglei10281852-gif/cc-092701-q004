@@ -56,6 +56,10 @@ def command_compute_demo() -> int:
         if created.status_code not in {201, 409}:
             print(created.text)
             return 1
+        published = client.post("/api/compute/templates/monte-carlo-demo/publish?actor=cli-demo", json={})
+        if published.status_code not in {201, 409}:
+            print(published.text)
+            return 1
         task = client.post(
             "/api/compute/tasks",
             json={
